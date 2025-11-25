@@ -1,6 +1,7 @@
 #include <napi.h>
 #include <X11/Xlib.h>
 #include <X11/Xutil.h>
+#include <X11/Xatom.h>
 
 typedef Window HMONITOR;
 typedef int DEVICE_SCALE_FACTOR;
@@ -9,6 +10,24 @@ struct Process {
     unsigned long pid;
     std::string path;
 };
+
+// 辅助函数：读取 X11 属性 (通用)
+unsigned char* get_x11_property(Display* disp, Window w, Atom prop, Atom* type_return, int* format_return, unsigned long* nitems_return) {
+    Atom type;
+    int format;
+    unsigned long nitems;
+    unsigned long bytes_after;
+    unsigned char* prop_return = NULL;
+
+    XGetWindowProperty(disp, w, prop, 0, 1024, False, AnyPropertyType,
+                       &type, &format, &nitems, &bytes_after, &prop_return);
+
+    if (type_return) *type_return = type;
+    if (format_return) *format_return = format;
+    if (nitems_return) *nitems_return = nitems;
+
+    return prop_return;
+}
 
 Process getWindowProcess (Window handle) {
     throw "getWindowProcess is not implemented on Linux";
@@ -135,62 +154,89 @@ Napi::Boolean isWindow (const Napi::CallbackInfo& info) {
 }
 
 // --- 新增功能: 获取指定坐标下的顶层窗口句柄 (Linux/X11) ---
+// info[0]: x, info[1]: y, info[2]: excludedId (可选)
 Napi::Number getWindowAtPoint(const Napi::CallbackInfo& info) {
     Napi::Env env{ info.Env() };
 
-    // 1. 检查参数 (虽然我们实际使用 XQueryPointer 获取位置，但 Napi 函数约定需要 x, y)
     if (info.Length() < 2 || !info[0].IsNumber() || !info[1].IsNumber()) {
-        // 尽管传入的 x, y 在 XQueryPointer 中不直接使用，但仍需要检查类型
         Napi::TypeError::New(env, "Expected x and y coordinates (Number)").ThrowAsJavaScriptException();
         return Napi::Number::New(env, 0);
     }
 
-    Display* display = XOpenDisplay(NULL);
-    if (!display) {
-        return Napi::Number::New(env, 0);
+    // 提取要排除的句柄 ID (可选参数)
+    Window excludedId = 0;
+    if (info.Length() > 2 && info[2].IsNumber()) {
+        // XID 是 32 位，但从 Napi::Number 读取 64 位更安全
+        excludedId = static_cast<Window>(info[2].As<Napi::Number>().Int64Value());
     }
 
-    // 根窗口
+    Display* display = XOpenDisplay(NULL);
+    if (!display) return Napi::Number::New(env, 0);
+
     Window root = XDefaultRootWindow(display);
 
-    // XQueryPointer 的输出变量
+    // 1. 获取鼠标在根窗口上的坐标 (用于命中测试)
     Window root_return, child_return;
     int root_x, root_y;
     int win_x, win_y;
     unsigned int mask_return;
+    // 使用传入的坐标进行检查，而不是实际鼠标位置（更灵活）
+    // 但为了确保准确性，我们通常使用 XQueryPointer 获取当前鼠标位置。
+    // 由于用户传入了 x, y，我们直接使用传入的 x, y 作为根坐标 (root_x, root_y)
+    root_x = info[0].As<Napi::Number>().Int32Value();
+    root_y = info[1].As<Napi::Number>().Int32Value();
 
-    // 2. 查询鼠标指针状态
-    // XQueryPointer 会获取当前鼠标位置，以及鼠标指针所在窗口 ID (child_return)
-    Status status = XQueryPointer(display, root,
-                                  &root_return, &child_return,
-                                  &root_x, &root_y,
-                                  &win_x, &win_y,
-                                  &mask_return);
+    // 如果需要获取当前鼠标位置，请取消注释 XQueryPointer，并使用它的 root_x/root_y
 
-    Window target_window = 0;
+    // 2. 获取按 Z-Order (堆叠顺序) 排序的窗口列表
+    Atom client_list_stacking = XInternAtom(display, "_NET_CLIENT_LIST_STACKING", False);
+    unsigned long nitems;
+    unsigned char *prop = get_x11_property(display, root, client_list_stacking, NULL, NULL, &nitems);
 
-    if (status) {
-        // 如果 child_return 不为 None (0)，则表示鼠标在一个子窗口上，通常就是应用窗口
-        if (child_return != None) {
-            // 鼠标正停留在某个窗口上
-            target_window = child_return;
+    if (!prop) {
+        XCloseDisplay(display);
+        return Napi::Number::New(env, 0);
+    }
 
-            // XQueryPointer 可能会返回窗口装饰或边框。
-            // 理论上，我们需要遍历找到最顶级的应用窗口，但 X11 没有标准的 API 直接进行精确的 Z-Order Hit Test。
-            // 对于截图/拾取功能，返回 child_return (即鼠标所在的窗口) 通常是可接受的。
+    Window *windows = (Window*)prop;
+    Window foundWindow = 0;
 
-            // 可选：如果 child_return 是根窗口，但 XQueryPointer 确实找到了一个子窗口，则使用 child_return
-            if (target_window == root) {
-                // 如果鼠标在根窗口上，但 XQueryPointer 找到了一个子窗口，说明它是根窗口的直接子窗口
-                // 由于 XQueryPointer 已经是点击测试的结果，我们信任它。
-            }
+    // 3. 迭代 Z-Order (从顶层到底层)
+    for (unsigned long i = 0; i < nitems; i++) {
+        Window current = windows[i];
+
+        // A. 检查排除条件
+        if (excludedId != 0 && current == excludedId) {
+            continue; // ID 匹配，跳过此窗口，检查下一层
+        }
+
+        // B. 检查窗口是否可见 (是否已映射)
+        XWindowAttributes attr;
+        if (!XGetWindowAttributes(display, current, &attr) || attr.map_state != IsViewable) {
+            continue;
+        }
+
+        // C. 获取窗口的几何信息
+        Window junk;
+        int x_geom, y_geom;
+        unsigned int width, height, border_width, depth;
+        // 注意：XGetGeometry 获取的坐标是相对于 Root Window 的
+        XGetGeometry(display, current, &junk, &x_geom, &y_geom, &width, &height, &border_width, &depth);
+
+        // D. 执行命中测试 (检查传入的坐标是否在窗口几何范围内)
+        if (root_x >= x_geom && root_x < (x_geom + (int)width) &&
+            root_y >= y_geom && root_y < (y_geom + (int)height))
+        {
+            // 找到了一个符合条件的窗口 (命中, 可见, 且未被排除)
+            foundWindow = current;
+            break;
         }
     }
 
+    XFree(prop); // 释放获取到的属性内存
     XCloseDisplay(display);
 
-    // 返回找到的窗口 ID，如果未找到则返回 0
-    return Napi::Number::New (env, static_cast<int64_t> (target_window));
+    return Napi::Number::New(env, static_cast<int64_t>(foundWindow));
 }
 
 Napi::Object Init(Napi::Env env, Napi::Object exports) {

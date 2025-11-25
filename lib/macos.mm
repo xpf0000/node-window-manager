@@ -330,19 +330,26 @@ Napi::Boolean setWindowMaximized(const Napi::CallbackInfo &info) {
 }
 
 // --- 新增功能: 获取指定坐标下的顶层窗口句柄 (macOS) ---
+// info[0]: x, info[1]: y, info[2]: excludedId (可选)
 Napi::Number getWindowAtPoint(const Napi::CallbackInfo& info) {
   Napi::Env env{info.Env()};
 
-  // 1. 检查参数
+  // 1. 检查坐标参数
   if (info.Length() < 2 || !info[0].IsNumber() || !info[1].IsNumber()) {
     Napi::TypeError::New(env, "Expected x and y coordinates (Number)").ThrowAsJavaScriptException();
     return Napi::Number::New(env, 0);
   }
 
-  // macOS 使用逻辑坐标，直接使用即可
+  // 提取坐标 (macOS 使用逻辑坐标)
   double x = info[0].As<Napi::Number>().DoubleValue();
   double y = info[1].As<Napi::Number>().DoubleValue();
   CGPoint point = CGPointMake((CGFloat)x, (CGFloat)y);
+
+  // 提取要排除的句柄 ID (可选参数)
+  int excludedId = 0;
+  if (info.Length() > 2 && info[2].IsNumber()) {
+      excludedId = info[2].As<Napi::Number>().Int32Value();
+  }
 
   // 2. 获取屏幕窗口列表 (按 Z-Order 从顶到底)
   CGWindowListOption listOptions = kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements;
@@ -361,7 +368,15 @@ Napi::Number getWindowAtPoint(const Napi::CallbackInfo& info) {
     // 判断坐标是否命中
     if (CGRectContainsPoint(bounds, point)) {
 
-      // --- 过滤逻辑开始 ---
+      // --- 排除 ID 逻辑开始 (Step A) ---
+      NSNumber *windowNumber = infoDict[(id)kCGWindowNumber];
+      if (excludedId != 0 && [windowNumber intValue] == excludedId) {
+          // ID 匹配，跳过此窗口，继续检查下一层窗口
+          continue;
+      }
+      // --- 排除 ID 逻辑结束 ---
+
+      // --- 原始过滤逻辑开始 ---
 
       // 1. 忽略完全透明的窗口
       NSNumber *alpha = infoDict[(id)kCGWindowAlpha];
@@ -373,17 +388,15 @@ Napi::Number getWindowAtPoint(const Napi::CallbackInfo& info) {
       if (layer && [layer intValue] < 0) continue;
 
       // 3. 确保它属于一个真实的前台应用程序
-      // 这一步最关键，能过滤掉 WindowServer 的鬼影窗口
       NSNumber *ownerPid = infoDict[(id)kCGWindowOwnerPID];
       NSRunningApplication *app = [NSRunningApplication runningApplicationWithProcessIdentifier: [ownerPid intValue]];
 
       if (app && app.activationPolicy == NSApplicationActivationPolicyRegular) {
          // 找到了！记录 ID 并停止循环
-         NSNumber *windowNumber = infoDict[(id)kCGWindowNumber];
-         foundHandle = [windowNumber intValue];
+         foundHandle = [windowNumber intValue]; // windowNumber 已在 Step A 获取
          break;
       }
-      // --- 过滤逻辑结束 ---
+      // --- 原始过滤逻辑结束 ---
     }
   }
 

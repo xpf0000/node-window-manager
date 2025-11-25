@@ -576,7 +576,8 @@ Napi::Boolean showInstantly(const Napi::CallbackInfo& info) {
     return Napi::Boolean::New(env, true);
 }
 
-// --- 新增功能: 获取指定坐标下的顶层窗口 ---
+// --- 新增功能: 获取指定坐标下的顶层窗口 (Windows) ---
+// info[0]: x, info[1]: y, info[2]: excludedHandleId (可选)
 Napi::Number getWindowAtPoint(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
 
@@ -585,7 +586,7 @@ Napi::Number getWindowAtPoint(const Napi::CallbackInfo& info) {
         return Napi::Number::New(env, 0);
     }
 
-    // 获取传入的坐标 (注意: Windows API 需要物理像素)
+    // 1. 获取传入的坐标 (Windows API 需要物理像素)
     long x = info[0].As<Napi::Number>().Int32Value();
     long y = info[1].As<Napi::Number>().Int32Value();
 
@@ -593,21 +594,57 @@ Napi::Number getWindowAtPoint(const Napi::CallbackInfo& info) {
     pt.x = x;
     pt.y = y;
 
-    // 1. 获取该点最上层的窗口句柄 (可能是按钮、子控件等)
-    HWND hWnd = WindowFromPoint(pt);
-
-    if (hWnd != NULL) {
-        // 2. WindowFromPoint 经常会返回窗口内部的子元素。
-        // 使用 GetAncestor(GA_ROOT) 向上查找，直到找到它的主窗口(根窗口)。
-        // 这样可以确保你拿到的是整个"Chrome"窗口，而不是里面的"渲染区域"。
-        HWND hRoot = GetAncestor(hWnd, GA_ROOT);
-        if (hRoot != NULL) {
-            hWnd = hRoot;
-        }
+    // 2. 获取要排除的句柄 ID (可选参数)
+    // 由于 HWND 是 64 位的，我们将其读取为 64 位整数指针
+    HWND excludedWindow = NULL;
+    if (info.Length() > 2 && info[2].IsNumber()) {
+        int64_t excludedHandle = info[2].As<Napi::Number>().Int64Value();
+        excludedWindow = reinterpret_cast<HWND>(excludedHandle);
     }
 
-    // 返回窗口句柄 (Int64)
-    return Napi::Number::New(env, reinterpret_cast<int64_t>(hWnd));
+    HWND finalWindow = NULL;
+    HWND currentWindow = WindowFromPoint(pt);
+
+    // 3. 循环查找，实现窗口穿透
+    while (currentWindow != NULL) {
+
+        // A. 找到根窗口 (主窗口)
+        HWND hRoot = GetAncestor(currentWindow, GA_ROOT);
+        if (hRoot != NULL) {
+            currentWindow = hRoot;
+        }
+
+        // B. 检查是否需要排除
+        if (excludedWindow != NULL && currentWindow == excludedWindow) {
+            // 窗口句柄匹配，需要穿透到下一层
+
+            // (i) 临时禁用此窗口，使其对 WindowFromPoint 不可见
+            EnableWindow(currentWindow, FALSE);
+
+            // (ii) 再次调用 WindowFromPoint，找到下面的窗口
+            HWND nextWindow = WindowFromPoint(pt);
+
+            // (iii) 立即重新启用原始窗口
+            EnableWindow(currentWindow, TRUE);
+
+            // (iv) 检查结果
+            if (nextWindow == currentWindow || nextWindow == NULL) {
+                // 如果下一层没有窗口或返回了同一窗口，则停止搜索
+                currentWindow = NULL;
+                break;
+            }
+
+            currentWindow = nextWindow; // 继续循环，检查新找到的窗口
+            continue; // 跳过本次循环的剩余部分，进入下一次检查
+        }
+
+        // C. 找到一个非排除的窗口 (或未设置排除 ID)
+        finalWindow = currentWindow;
+        break;
+    }
+
+    // 4. 返回窗口句柄 (Int64)
+    return Napi::Number::New(env, reinterpret_cast<int64_t>(finalWindow));
 }
 
 Napi::Object Init (Napi::Env env, Napi::Object exports) {
