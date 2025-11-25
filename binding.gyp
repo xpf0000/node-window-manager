@@ -11,7 +11,11 @@
       	}],
         ["OS=='mac'", {
       	  "sources": [ "lib/macos.mm" ],
-          "libraries": [ '-framework AppKit', '-framework ApplicationServices' ]
+          "libraries": [ '-framework AppKit', '-framework ApplicationServices' ],
+          "xcode_settings": {
+                      "CLANG_CXX_LANGUAGE_STANDARD": "c++17",
+                      "CLANG_CXX_LIBRARY": "libc++"
+                    }
       	}],
         ["OS=='linux'", {
           "sources": [ "lib/linux.cpp" ]
