@@ -62,8 +62,11 @@ class WindowManager extends EventEmitter {
     return new Window(addon.getActiveWindow())
   }
 
-  getWindowAtPoint = (x: number, y: number) => {
+  getWindowAtPoint = (x: number, y: number, excludeID?: number) => {
     if (!addon) return
+    if (excludeID) {
+      return new Window(addon.getWindowAtPoint(x, y, excludeID))
+    }
     return new Window(addon.getWindowAtPoint(x, y))
   }
 
