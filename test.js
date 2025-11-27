@@ -10,7 +10,7 @@ async function main() {
   console.log("bounds", activeRect)
   console.log(`---`)
 
-  const pointWindow = windowManager.getWindowAtPoint(200, 200)
+  const pointWindow = windowManager.getWindowAtPoint(100, 100)
   console.log("pointWindow name", pointWindow.getName())
   console.log("pointWindow title", pointWindow.getTitle())
   console.log("pointWindow bounds", pointWindow.getBounds())
@@ -37,6 +37,13 @@ async function main() {
   }
 
   console.log(`---`)
+
+  // const image = windowManager.captureWindow(pointWindow.id)
+  // console.log(`image: `, image)
+
+  windowManager.cleanup()
 }
 
 main()
+
+// console.log("---")

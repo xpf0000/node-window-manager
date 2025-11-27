@@ -70,6 +70,16 @@ class WindowManager extends EventEmitter {
     return new Window(addon.getWindowAtPoint(x, y))
   }
 
+  captureWindow(windowID: number) {
+    if (!addon) return
+    return addon.captureWindow(windowID)
+  }
+
+  cleanup() {
+    if (!addon) return
+    return addon.cleanup()
+  }
+
   getWindows = (): Window[] => {
     if (!addon || !addon.getWindows) return []
     return addon

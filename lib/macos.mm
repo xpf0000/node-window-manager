@@ -4,409 +4,721 @@
 #include <napi.h>
 #include <string>
 #include <map>
-#include <thread>
-#include <fstream>
-#include <iostream> // Add this line at the top of the file
-
-extern "C" AXError _AXUIElementGetWindow(AXUIElementRef, CGWindowID* out);
+#include <vector>
+#include <cmath>
+#include <iostream>
+#include <Cocoa/Cocoa.h>
+#include <CoreGraphics/CoreGraphics.h>
+#include <ApplicationServices/ApplicationServices.h>
 
 // CGWindowID to AXUIElementRef windows map
 std::map<int, AXUIElementRef> windowsMap;
 
-bool _requestAccessibility(bool showDialog) {
-  NSDictionary* opts = @{static_cast<id> (kAXTrustedCheckOptionPrompt): showDialog ? @YES : @NO};
-  return AXIsProcessTrustedWithOptions(static_cast<CFDictionaryRef> (opts));
+// --- 辅助工具函数 ---
+
+// macOS 版本检查工具函数
+bool IsAtLeastMacOSVersion(int major, int minor = 0) {
+    if (@available(macOS 10.10, *)) {
+        NSOperatingSystemVersion version = [[NSProcessInfo processInfo] operatingSystemVersion];
+        return (version.majorVersion > major) ||
+               (version.majorVersion == major && version.minorVersion >= minor);
+    }
+    return true;
 }
 
-Napi::Boolean requestAccessibility(const Napi::CallbackInfo &info) {
-  Napi::Env env{info.Env()};
-  return Napi::Boolean::New(env, _requestAccessibility(true));
+// 辅助功能权限检查
+bool _requestAccessibility(bool showDialog) {
+    if (@available(macOS 10.9, *)) {
+        NSDictionary* opts = @{(id)kAXTrustedCheckOptionPrompt: @(showDialog)};
+        return AXIsProcessTrustedWithOptions((__bridge CFDictionaryRef)opts);
+    } else {
+        // 忽略弃用警告，因为这是旧系统的回退路径
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+        return AXAPIEnabled();
+#pragma clang diagnostic pop
+    }
 }
+
+// 缓存清理函数
+void cleanupWindowCache() {
+    for (auto& pair : windowsMap) {
+        if (pair.second) {
+            CFRelease(pair.second);
+        }
+    }
+    windowsMap.clear();
+}
+
+// 清理无效窗口的函数
+void cleanupInvalidWindows() {
+    std::vector<int> windowsToRemove;
+
+    for (const auto& pair : windowsMap) {
+        int handle = pair.first;
+        AXUIElementRef window = pair.second;
+
+        CFTypeRef role = NULL;
+        AXError error = AXUIElementCopyAttributeValue(window, kAXRoleAttribute, &role);
+
+        if (error != kAXErrorSuccess) {
+            windowsToRemove.push_back(handle);
+        }
+
+        if (role) CFRelease(role);
+    }
+
+    for (int handle : windowsToRemove) {
+        if (windowsMap.count(handle)) {
+            CFRelease(windowsMap[handle]);
+            windowsMap.erase(handle);
+        }
+    }
+}
+
+// 错误处理辅助函数
+bool HandleAXError(Napi::Env env, AXError error, const char* operation) {
+    if (error == kAXErrorSuccess) {
+        return false; // 没有错误
+    }
+
+    std::string message = std::string(operation) + " failed. AXError code: " + std::to_string(error) + " (";
+    switch (error) {
+        case kAXErrorFailure: message += "AX Failure)"; break;
+        case kAXErrorIllegalArgument: message += "Illegal Argument)"; break;
+        case kAXErrorInvalidUIElement: message += "Invalid UI Element)"; break;
+        case kAXErrorCannotComplete: message += "Cannot Complete)"; break;
+        case kAXErrorAttributeUnsupported: message += "Attribute Unsupported)"; break;
+        case kAXErrorActionUnsupported: message += "Action Unsupported)"; break;
+        default: message += "Unknown Error)"; break;
+    }
+
+    Napi::Error::New(env, message).ThrowAsJavaScriptException();
+    return true; // 有错误
+}
+
+// 替代私有 API _AXUIElementGetWindow 的公共 API 实现
+AXError GetWindowIDFromAXElement(AXUIElementRef element, CGWindowID* outWindowID) {
+    if (!element || !outWindowID) return kAXErrorInvalidUIElement;
+
+    *outWindowID = 0;
+    CFTypeRef gwtValue = NULL;
+    CFArrayRef windowList = NULL;
+    CFTypeRef positionValue = NULL;
+    CFTypeRef sizeValue = NULL;
+
+    // [修复] 将变量声明移动到 goto 之前，防止跳过初始化
+    CGPoint windowPos = CGPointZero;
+    CGSize windowSize = CGSizeZero;
+    pid_t elementPid;
+
+    // 1. 尝试 GWTIdentifier
+    AXError error = AXUIElementCopyAttributeValue(element, CFSTR("GWTIdentifier"), &gwtValue);
+    if (error == kAXErrorSuccess && gwtValue) {
+        if (CFGetTypeID(gwtValue) == CFNumberGetTypeID()) {
+            SInt64 tempID = 0;
+            if (CFNumberGetValue((CFNumberRef)gwtValue, kCFNumberSInt64Type, &tempID)) {
+                *outWindowID = (CGWindowID)tempID;
+            }
+        }
+        CFRelease(gwtValue);
+        if (*outWindowID != 0) return kAXErrorSuccess;
+    }
+
+    // 2. 几何匹配
+    error = AXUIElementGetPid(element, &elementPid);
+    if (error != kAXErrorSuccess) goto cleanup;
+
+    windowList = CGWindowListCopyWindowInfo(kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements, kCGNullWindowID);
+    if (!windowList) goto cleanup;
+
+    error = AXUIElementCopyAttributeValue(element, kAXPositionAttribute, &positionValue);
+    if (error != kAXErrorSuccess) goto cleanup;
+
+    error = AXUIElementCopyAttributeValue(element, kAXSizeAttribute, &sizeValue);
+    if (error != kAXErrorSuccess) goto cleanup;
+
+    // [修复] 添加 (AXValueType) 显式强制转换
+    if (AXValueGetValue((AXValueRef)positionValue, (AXValueType)kAXValueCGPointType, &windowPos) &&
+        AXValueGetValue((AXValueRef)sizeValue, (AXValueType)kAXValueCGSizeType, &windowSize)) {
+
+        CGRect windowRect = CGRectMake(windowPos.x, windowPos.y, windowSize.width, windowSize.height);
+
+        for (NSDictionary *windowInfo in (NSArray *)windowList) {
+            NSNumber *ownerPid = windowInfo[(id)kCGWindowOwnerPID];
+            if ([ownerPid intValue] != elementPid) continue;
+
+            CGRect bounds;
+            if (CGRectMakeWithDictionaryRepresentation((CFDictionaryRef)windowInfo[(id)kCGWindowBounds], &bounds)) {
+                if (fabs(bounds.origin.x - windowRect.origin.x) < 1 &&
+                    fabs(bounds.origin.y - windowRect.origin.y) < 1 &&
+                    fabs(bounds.size.width - windowRect.size.width) < 1 &&
+                    fabs(bounds.size.height - windowRect.size.height) < 1) {
+
+                    NSNumber *windowNumber = windowInfo[(id)kCGWindowNumber];
+                    *outWindowID = [windowNumber unsignedIntValue];
+                    break;
+                }
+            }
+        }
+    }
+
+cleanup:
+    if (gwtValue) CFRelease(gwtValue);
+    if (positionValue) CFRelease(positionValue);
+    if (sizeValue) CFRelease(sizeValue);
+    if (windowList) CFRelease(windowList);
+
+    return (*outWindowID != 0) ? kAXErrorSuccess : kAXErrorAttributeUnsupported;
+}
+
+// --- 核心窗口查找和缓存 ---
 
 NSDictionary* getWindowInfo(int handle) {
-  CGWindowListOption listOptions = kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements;
-  CFArrayRef windowList = CGWindowListCopyWindowInfo(listOptions, kCGNullWindowID);
+    CGWindowListOption listOptions = kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements;
+    CFArrayRef windowList = CGWindowListCopyWindowInfo(listOptions, kCGNullWindowID);
 
-  for (NSDictionary *info in (NSArray *)windowList) {
-    NSNumber *windowNumber = info[(id)kCGWindowNumber];
+    for (NSDictionary *info in (NSArray *)windowList) {
+        NSNumber *windowNumber = info[(id)kCGWindowNumber];
 
-    if ([windowNumber intValue] == handle) {
-        // Retain property list so it doesn't get release w. windowList
-        CFRetain((CFPropertyListRef)info);
-        CFRelease(windowList);
-        return info;
+        if ([windowNumber intValue] == handle) {
+            CFRetain((CFPropertyListRef)info);
+            CFRelease(windowList);
+            return info;
+        }
     }
-  }
 
-  if (windowList) {
-    CFRelease(windowList);
-  }
-  return NULL;
+    if (windowList) {
+        CFRelease(windowList);
+    }
+    return NULL;
 }
 
+// 修复后的 getAXWindow 函数
 AXUIElementRef getAXWindow(int pid, int handle) {
-  auto app = AXUIElementCreateApplication(pid);
+    AXUIElementRef app = AXUIElementCreateApplication(pid);
+    if (!app) return NULL;
 
-  CFArrayRef windows;
-  AXUIElementCopyAttributeValues(app, kAXWindowsAttribute, 0, 100, &windows);
+    CFArrayRef windows = NULL;
+    AXError error = AXUIElementCopyAttributeValues(app, kAXWindowsAttribute, 0, 100, &windows);
 
-  for (id child in  (NSArray *)windows) {
-    AXUIElementRef window = (AXUIElementRef) child;
+    AXUIElementRef foundWindow = NULL;
 
-    CGWindowID windowId;
-    _AXUIElementGetWindow(window, &windowId);
+    if (error == kAXErrorSuccess && windows && CFArrayGetCount(windows) > 0) {
+        CFIndex count = CFArrayGetCount(windows);
+        for (CFIndex i = 0; i < count; i++) {
+            AXUIElementRef window = (AXUIElementRef)CFArrayGetValueAtIndex(windows, i);
+            if (!window) continue;
 
-    if (windowId == static_cast<unsigned int>(handle)) {
-      // Retain returned window so it doesn't get released with rest of list
-      CFRetain(window);
-      CFRelease(windows);
-      return window;
+            CGWindowID windowId = 0;
+            if (GetWindowIDFromAXElement(window, &windowId) == kAXErrorSuccess &&
+                windowId == static_cast<unsigned int>(handle)) {
+                CFRetain(window);
+                foundWindow = window;
+                break;
+            }
+        }
+        CFRelease(windows);
     }
-  }
 
-  if (windows) {
-    CFRelease(windows);
-  }
-  return NULL;
+    CFRelease(app);
+    return foundWindow;
 }
 
 void cacheWindow(int handle, int pid) {
-  if (_requestAccessibility(false)) {
-    if (windowsMap.find(handle) == windowsMap.end()) {
-      windowsMap[handle] = getAXWindow(pid, handle);
+    if (_requestAccessibility(false)) {
+        if (windowsMap.find(handle) == windowsMap.end()) {
+            windowsMap[handle] = getAXWindow(pid, handle);
+        }
     }
-  }
 }
 
 void cacheWindowByInfo(NSDictionary* info) {
-  if (info) {
-    NSNumber *ownerPid = info[(id)kCGWindowOwnerPID];
-    NSNumber *windowNumber = info[(id)kCGWindowNumber];
-    // Release dictionary info property since we're done with it
-    CFRelease((CFPropertyListRef)info);
-    cacheWindow([windowNumber intValue], [ownerPid intValue]);
-  }
+    if (info) {
+        NSNumber *ownerPid = info[(id)kCGWindowOwnerPID];
+        NSNumber *windowNumber = info[(id)kCGWindowNumber];
+
+        cacheWindow([windowNumber intValue], [ownerPid intValue]);
+        CFRelease((CFPropertyListRef)info);
+    }
 }
 
 void findAndCacheWindow(int handle) {
-  cacheWindowByInfo(getWindowInfo(handle));
+    cacheWindowByInfo(getWindowInfo(handle));
 }
 
 AXUIElementRef getAXWindowById(int handle) {
-  auto win = windowsMap[handle];
+    auto win = windowsMap[handle];
 
-  if (!win) {
-    findAndCacheWindow(handle);
-    win = windowsMap[handle];
-  }
+    if (!win) {
+        findAndCacheWindow(handle);
+        win = windowsMap[handle];
+    }
 
-  return win;
+    return win;
+}
+
+// --- NAPI 导出函数 ---
+
+Napi::Boolean requestAccessibility(const Napi::CallbackInfo &info) {
+    Napi::Env env{info.Env()};
+    return Napi::Boolean::New(env, _requestAccessibility(true));
 }
 
 Napi::Array getWindows(const Napi::CallbackInfo &info) {
-  Napi::Env env{info.Env()};
+    Napi::Env env{info.Env()};
 
-  CGWindowListOption listOptions = kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements;
-  CFArrayRef windowList = CGWindowListCopyWindowInfo(listOptions, kCGNullWindowID);
+    CGWindowListOption listOptions = kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements;
+    CFArrayRef windowList = CGWindowListCopyWindowInfo(listOptions, kCGNullWindowID);
 
-  std::vector<Napi::Number> vec;
+    std::vector<Napi::Number> vec;
 
-  for (NSDictionary *info in (NSArray *)windowList) {
-    NSNumber *ownerPid = info[(id)kCGWindowOwnerPID];
-    NSNumber *windowNumber = info[(id)kCGWindowNumber];
+    for (NSDictionary *infoDict in (NSArray *)windowList) {
+        NSNumber *ownerPid = infoDict[(id)kCGWindowOwnerPID];
+        NSNumber *windowNumber = infoDict[(id)kCGWindowNumber];
 
-    auto app = [NSRunningApplication runningApplicationWithProcessIdentifier: [ownerPid intValue]];
-    auto path = (app && app.bundleURL && app.bundleURL.path) ? [app.bundleURL.path UTF8String] : "";
+        @autoreleasepool {
+            auto app = [NSRunningApplication runningApplicationWithProcessIdentifier: [ownerPid intValue]];
+            auto path = (app && app.bundleURL && app.bundleURL.path) ? [app.bundleURL.path UTF8String] : "";
 
-     if (app && strcmp(path, "") != 0)  {
-      vec.push_back(Napi::Number::New(env, [windowNumber intValue]));
+            if (app && strcmp(path, "") != 0)  {
+                vec.push_back(Napi::Number::New(env, [windowNumber intValue]));
+            }
+        }
     }
-  }
 
-  auto arr = Napi::Array::New(env, vec.size());
+    auto arr = Napi::Array::New(env, vec.size());
 
-  for (size_t i = 0; i < vec.size(); i++) {
-    arr[i] = vec[i];
-  }
+    for (size_t i = 0; i < vec.size(); i++) {
+        arr[i] = vec[i];
+    }
 
-  if (windowList) {
-    CFRelease(windowList);
-  }
-  
-  return arr;
+    if (windowList) {
+        CFRelease(windowList);
+    }
+
+    return arr;
 }
 
 Napi::Number getActiveWindow(const Napi::CallbackInfo &info) {
-  Napi::Env env{info.Env()};
+    Napi::Env env{info.Env()};
 
-  CGWindowListOption listOptions = kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements;
-  CFArrayRef windowList = CGWindowListCopyWindowInfo(listOptions, kCGNullWindowID);
+    CGWindowListOption listOptions = kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements;
+    CFArrayRef windowList = CGWindowListCopyWindowInfo(listOptions, kCGNullWindowID);
 
-  for (NSDictionary *info in (NSArray *)windowList) {
-    NSNumber *ownerPid = info[(id)kCGWindowOwnerPID];
-    NSNumber *windowNumber = info[(id)kCGWindowNumber];
+    for (NSDictionary *infoDict in (NSArray *)windowList) {
+        NSNumber *ownerPid = infoDict[(id)kCGWindowOwnerPID];
+        NSNumber *windowNumber = infoDict[(id)kCGWindowNumber];
 
-    auto app = [NSRunningApplication runningApplicationWithProcessIdentifier: [ownerPid intValue]];
+        @autoreleasepool {
+            auto app = [NSRunningApplication runningApplicationWithProcessIdentifier: [ownerPid intValue]];
 
-    if (app) {
-      if ([app isActive]) {
-        CFRelease(windowList);
-        return Napi::Number::New(env, [windowNumber intValue]);
-      }
-    } else {
-      // std::cerr << "App is null for PID: " << [ownerPid intValue] << std::endl;
+            if (app) {
+                if ([app isActive]) {
+                    CFRelease(windowList);
+                    return Napi::Number::New(env, [windowNumber intValue]);
+                }
+            }
+        }
     }
-  }
 
-  if (windowList) {
-    CFRelease(windowList);
-  }
-  return Napi::Number::New(env, 0);
+    if (windowList) {
+        CFRelease(windowList);
+    }
+    return Napi::Number::New(env, 0);
 }
 
 Napi::Object initWindow(const Napi::CallbackInfo &info) {
-  Napi::Env env{info.Env()};
+    Napi::Env env{info.Env()};
+    int handle = info[0].As<Napi::Number>().Int32Value();
+    auto wInfo = getWindowInfo(handle);
 
-  int handle = info[0].As<Napi::Number>().Int32Value();
+    if (wInfo) {
+        // 先获取需要的数据
+        NSNumber *ownerPid = wInfo[(id)kCGWindowOwnerPID];
+        int pidValue = [ownerPid intValue]; // 拷贝 int 值，这是安全的
 
-  auto wInfo = getWindowInfo(handle);
+        @autoreleasepool {
+            NSRunningApplication *app = [NSRunningApplication runningApplicationWithProcessIdentifier: pidValue];
 
-  if (wInfo) {
-    NSNumber *ownerPid = wInfo[(id)kCGWindowOwnerPID];
-    NSRunningApplication *app = [NSRunningApplication runningApplicationWithProcessIdentifier: [ownerPid intValue]];
-    if (!app || !app.bundleURL || !app.bundleURL.path) {
-      return Napi::Object::New(env);
+            if (!app || !app.bundleURL || !app.bundleURL.path) {
+                CFRelease((CFPropertyListRef)wInfo);
+                return Napi::Object::New(env);
+            }
+
+            auto obj = Napi::Object::New(env);
+            obj.Set("processId", pidValue);
+            obj.Set("path", [app.bundleURL.path UTF8String]);
+
+            // 使用 cacheWindowByInfo 来处理缓存和 wInfo 的释放
+            // cacheWindowByInfo 内部会调用 CFRelease(info)，所以这里不需要手动释放
+            cacheWindowByInfo(wInfo);
+
+            return obj;
+        }
     }
 
-    auto obj = Napi::Object::New(env);
-    obj.Set("processId", [ownerPid intValue]);
-    obj.Set("path", [app.bundleURL.path UTF8String]);
-
-    cacheWindow(handle, [ownerPid intValue]);
-
-    return obj;
-  }
-
-  return Napi::Object::New(env);
+    return Napi::Object::New(env);
 }
 
 Napi::String getWindowTitle(const Napi::CallbackInfo &info) {
-  Napi::Env env{info.Env()};
+    Napi::Env env{info.Env()};
+    int handle = info[0].As<Napi::Number>().Int32Value();
+    auto wInfo = getWindowInfo(handle);
 
-  int handle = info[0].As<Napi::Number>().Int32Value();
+    if (wInfo) {
+        @autoreleasepool {
+            // 1. 获取 NSString
+            NSString *title = wInfo[(id)kCGWindowOwnerName];
+            Napi::String result;
 
-  auto wInfo = getWindowInfo(handle);
+            // 2. 在释放字典前，将 NSString 转换为 Napi::String
+            if (title) {
+                result = Napi::String::New(env, [title UTF8String]);
+            } else {
+                result = Napi::String::New(env, "");
+            }
 
-  if (wInfo) {
-    NSString *windowName = wInfo[(id)kCGWindowOwnerName];
-    if (!windowName) {
-      return Napi::String::New(env, "");
+            // 3. 安全释放字典
+            CFRelease((CFPropertyListRef)wInfo);
+
+            return result;
+        }
     }
-    return Napi::String::New(env, [windowName UTF8String]);
-  }
-
-  return Napi::String::New(env, "");
+    return Napi::String::New(env, "");
 }
 
 Napi::String getWindowName(const Napi::CallbackInfo &info) {
-  Napi::Env env{info.Env()};
+    Napi::Env env{info.Env()};
+    int handle = info[0].As<Napi::Number>().Int32Value();
+    auto wInfo = getWindowInfo(handle);
 
-  int handle = info[0].As<Napi::Number>().Int32Value();
+    if (wInfo) {
+        @autoreleasepool {
+            // 1. 获取 NSString
+            NSString *name = wInfo[(id)kCGWindowName];
+            Napi::String result;
 
-  auto wInfo = getWindowInfo(handle);
+            // 2. 在释放字典前转换
+            if (name) {
+                result = Napi::String::New(env, [name UTF8String]);
+            } else {
+                result = Napi::String::New(env, "");
+            }
 
-  if (wInfo) {
-    NSString *windowName = wInfo[(id)kCGWindowName];
-    if (!windowName) {
-      return Napi::String::New(env, "");
+            // 3. 安全释放字典
+            CFRelease((CFPropertyListRef)wInfo);
+
+            return result;
+        }
     }
-    return Napi::String::New(env, [windowName UTF8String]);
-  }
-
-  return Napi::String::New(env, "");
+    return Napi::String::New(env, "");
 }
 
 Napi::Object getWindowBounds(const Napi::CallbackInfo &info) {
-   Napi::Env env{info.Env()};
+    Napi::Env env{info.Env()};
+    int handle = info[0].As<Napi::Number>().Int32Value();
+    auto wInfo = getWindowInfo(handle);
 
-  int handle = info[0].As<Napi::Number>().Int32Value();
+    if (wInfo) {
+        CGRect bounds;
+        CGRectMakeWithDictionaryRepresentation((CFDictionaryRef)wInfo[(id)kCGWindowBounds], &bounds);
+        CFRelease((CFPropertyListRef)wInfo);
 
-  auto wInfo = getWindowInfo(handle);
+        auto obj = Napi::Object::New(env);
+        obj.Set("x", bounds.origin.x);
+        obj.Set("y", bounds.origin.y);
+        obj.Set("width", bounds.size.width);
+        obj.Set("height", bounds.size.height);
 
-  if (wInfo) {
-    CGRect bounds;
-    CGRectMakeWithDictionaryRepresentation((CFDictionaryRef)wInfo[(id)kCGWindowBounds], &bounds);
-
-    auto obj = Napi::Object::New(env);
-    obj.Set("x", bounds.origin.x);
-    obj.Set("y", bounds.origin.y);
-    obj.Set("width", bounds.size.width);
-    obj.Set("height", bounds.size.height);
-
-    return obj;
-  }
-
-  return Napi::Object::New(env);
+        return obj;
+    }
+    return Napi::Object::New(env);
 }
 
 Napi::Boolean setWindowBounds(const Napi::CallbackInfo &info) {
-  Napi::Env env{info.Env()};
+    Napi::Env env{info.Env()};
+    if (!IsAtLeastMacOSVersion(10, 9)) return Napi::Boolean::New(env, false);
 
-  auto handle = info[0].As<Napi::Number>().Int32Value();
-  auto bounds = info[1].As<Napi::Object>();
+    auto handle = info[0].As<Napi::Number>().Int32Value();
+    auto bounds = info[1].As<Napi::Object>();
 
-  auto x = bounds.Get("x").As<Napi::Number>().DoubleValue();
-  auto y = bounds.Get("y").As<Napi::Number>().DoubleValue();
-  auto width = bounds.Get("width").As<Napi::Number>().DoubleValue();
-  auto height = bounds.Get("height").As<Napi::Number>().DoubleValue();
+    auto x = bounds.Get("x").As<Napi::Number>().DoubleValue();
+    auto y = bounds.Get("y").As<Napi::Number>().DoubleValue();
+    auto width = bounds.Get("width").As<Napi::Number>().DoubleValue();
+    auto height = bounds.Get("height").As<Napi::Number>().DoubleValue();
 
-  auto win = getAXWindowById(handle);
+    auto win = getAXWindowById(handle);
+    if (!win) {
+        return Napi::Boolean::New(env, false);
+    }
 
-  if (win) {
-    NSPoint point = NSMakePoint((CGFloat) x, (CGFloat) y);
-    NSSize size = NSMakeSize((CGFloat) width, (CGFloat) height);
+    NSPoint point = NSMakePoint((CGFloat)x, (CGFloat)y);
+    NSSize size = NSMakeSize((CGFloat)width, (CGFloat)height);
 
-    CFTypeRef positionStorage = (CFTypeRef)(AXValueCreate((AXValueType)kAXValueCGPointType, (const void *)&point));
-    AXUIElementSetAttributeValue(win, kAXPositionAttribute, positionStorage);
+    // [修复] 添加 (AXValueType) 显式强制转换
+    CFTypeRef positionStorage = AXValueCreate((AXValueType)kAXValueCGPointType, &point);
+    CFTypeRef sizeStorage = AXValueCreate((AXValueType)kAXValueCGSizeType, &size);
 
-    CFTypeRef sizeStorage = (CFTypeRef)(AXValueCreate((AXValueType)kAXValueCGSizeType, (const void *)&size));
-    AXUIElementSetAttributeValue(win, kAXSizeAttribute, sizeStorage);
-  }
+    bool success = true;
 
-  return Napi::Boolean::New(env, true);
+    if (positionStorage) {
+        AXError err = AXUIElementSetAttributeValue(win, kAXPositionAttribute, positionStorage);
+        CFRelease(positionStorage);
+        if (HandleAXError(env, err, "setWindowBounds: kAXPositionAttribute")) {
+            success = false;
+        }
+    }
+
+    if (sizeStorage && success) {
+        AXError err = AXUIElementSetAttributeValue(win, kAXSizeAttribute, sizeStorage);
+        CFRelease(sizeStorage);
+        if (HandleAXError(env, err, "setWindowBounds: kAXSizeAttribute")) {
+            success = false;
+        }
+    }
+
+    return Napi::Boolean::New(env, success);
 }
 
 Napi::Boolean bringWindowToTop(const Napi::CallbackInfo &info) {
-  Napi::Env env{info.Env()};
+    Napi::Env env{info.Env()};
+    if (!IsAtLeastMacOSVersion(10, 9)) return Napi::Boolean::New(env, false);
 
-  auto handle = info[0].As<Napi::Number>().Int32Value();
-  auto pid = info[1].As<Napi::Number>().Int32Value();
+    auto handle = info[0].As<Napi::Number>().Int32Value();
+    auto pid = info[1].As<Napi::Number>().Int32Value();
 
-  auto app = AXUIElementCreateApplication(pid);
-  auto win = getAXWindowById(handle);
+    AXUIElementRef app = AXUIElementCreateApplication(pid);
+    AXUIElementRef win = getAXWindowById(handle);
 
-  AXUIElementSetAttributeValue(app, kAXFrontmostAttribute, kCFBooleanTrue);
-  AXUIElementSetAttributeValue(win, kAXMainAttribute, kCFBooleanTrue);
+    bool success = true;
 
-  return Napi::Boolean::New(env, true);
+    if (app) {
+        AXError err = AXUIElementSetAttributeValue(app, kAXFrontmostAttribute, kCFBooleanTrue);
+        CFRelease(app);
+        if (HandleAXError(env, err, "bringWindowToTop: kAXFrontmostAttribute")) {
+            success = false;
+        }
+    }
+
+    if (win && success) {
+        AXError err = AXUIElementSetAttributeValue(win, kAXMainAttribute, kCFBooleanTrue);
+        if (HandleAXError(env, err, "bringWindowToTop: kAXMainAttribute")) {
+            success = false;
+        }
+    }
+
+    return Napi::Boolean::New(env, success);
 }
 
 Napi::Boolean setWindowMinimized(const Napi::CallbackInfo &info) {
-  Napi::Env env{info.Env()};
+    Napi::Env env{info.Env()};
+    if (!IsAtLeastMacOSVersion(10, 9)) return Napi::Boolean::New(env, false);
 
-  auto handle = info[0].As<Napi::Number>().Int32Value();
-  auto toggle = info[1].As<Napi::Boolean>();
+    auto handle = info[0].As<Napi::Number>().Int32Value();
+    auto toggle = info[1].As<Napi::Boolean>();
 
-  auto win = getAXWindowById(handle);
+    auto win = getAXWindowById(handle);
+    if (!win) {
+        return Napi::Boolean::New(env, false);
+    }
 
-  if (win) {
-    AXUIElementSetAttributeValue(win, kAXMinimizedAttribute, toggle ? kCFBooleanTrue : kCFBooleanFalse);
-  }
+    AXError err = AXUIElementSetAttributeValue(win, kAXMinimizedAttribute, toggle ? kCFBooleanTrue : kCFBooleanFalse);
+    if (HandleAXError(env, err, "setWindowMinimized: kAXMinimizedAttribute")) {
+        return Napi::Boolean::New(env, false);
+    }
 
-  return Napi::Boolean::New(env, true);
+    return Napi::Boolean::New(env, true);
 }
 
 Napi::Boolean setWindowMaximized(const Napi::CallbackInfo &info) {
-  Napi::Env env{info.Env()};
-  auto handle = info[0].As<Napi::Number>().Int32Value();
-  auto win = getAXWindowById(handle);
+    Napi::Env env{info.Env()};
+    if (!IsAtLeastMacOSVersion(10, 9)) return Napi::Boolean::New(env, false);
 
-  if(win) {
-    NSRect screenSizeRect = [[NSScreen mainScreen] frame];
-    int screenWidth = screenSizeRect.size.width;
-    int screenHeight = screenSizeRect.size.height;
+    auto handle = info[0].As<Napi::Number>().Int32Value();
+    auto win = getAXWindowById(handle);
 
-    NSPoint point = NSMakePoint((CGFloat) 0, (CGFloat) 0);
-    NSSize size = NSMakeSize((CGFloat) screenWidth, (CGFloat) screenHeight);
+    if (!win) {
+        return Napi::Boolean::New(env, false);
+    }
 
-    CFTypeRef positionStorage = (CFTypeRef)(AXValueCreate((AXValueType)kAXValueCGPointType, (const void *)&point));
-    AXUIElementSetAttributeValue(win, kAXPositionAttribute, positionStorage);
+    @autoreleasepool {
+        NSScreen *mainScreen = [NSScreen mainScreen];
+        if (!mainScreen) return Napi::Boolean::New(env, false);
 
-    CFTypeRef sizeStorage = (CFTypeRef)(AXValueCreate((AXValueType)kAXValueCGSizeType, (const void *)&size));
-    AXUIElementSetAttributeValue(win, kAXSizeAttribute, sizeStorage);
-  }
+        NSRect screenFrame = [mainScreen frame];
+        NSRect visibleFrame = [mainScreen visibleFrame];
 
-  return Napi::Boolean::New(env, true);
+        CGFloat ax_x = visibleFrame.origin.x;
+        CGFloat ax_y = screenFrame.size.height - visibleFrame.origin.y - visibleFrame.size.height;
+        CGFloat ax_width = visibleFrame.size.width;
+        CGFloat ax_height = visibleFrame.size.height;
+
+        NSPoint point = NSMakePoint(ax_x, ax_y);
+        NSSize size = NSMakeSize(ax_width, ax_height);
+
+        // [修复] 添加 (AXValueType) 显式强制转换
+        CFTypeRef positionStorage = AXValueCreate((AXValueType)kAXValueCGPointType, &point);
+        CFTypeRef sizeStorage = AXValueCreate((AXValueType)kAXValueCGSizeType, &size);
+
+        bool success = true;
+
+        if (positionStorage) {
+            AXError err = AXUIElementSetAttributeValue(win, kAXPositionAttribute, positionStorage);
+            CFRelease(positionStorage);
+            if (HandleAXError(env, err, "setWindowMaximized: kAXPositionAttribute")) {
+                success = false;
+            }
+        }
+
+        if (sizeStorage && success) {
+            AXError err = AXUIElementSetAttributeValue(win, kAXSizeAttribute, sizeStorage);
+            CFRelease(sizeStorage);
+            if (HandleAXError(env, err, "setWindowMaximized: kAXSizeAttribute")) {
+                success = false;
+            }
+        }
+
+        return Napi::Boolean::New(env, success);
+    }
 }
 
-// --- 新增功能: 获取指定坐标下的顶层窗口句柄 (macOS) ---
-// info[0]: x, info[1]: y, info[2]: excludedId (可选)
 Napi::Number getWindowAtPoint(const Napi::CallbackInfo& info) {
-  Napi::Env env{info.Env()};
+    Napi::Env env{info.Env()};
 
-  // 1. 检查坐标参数
-  if (info.Length() < 2 || !info[0].IsNumber() || !info[1].IsNumber()) {
-    Napi::TypeError::New(env, "Expected x and y coordinates (Number)").ThrowAsJavaScriptException();
-    return Napi::Number::New(env, 0);
-  }
-
-  // 提取坐标 (macOS 使用逻辑坐标)
-  double x = info[0].As<Napi::Number>().DoubleValue();
-  double y = info[1].As<Napi::Number>().DoubleValue();
-  CGPoint point = CGPointMake((CGFloat)x, (CGFloat)y);
-
-  // 提取要排除的句柄 ID (可选参数)
-  int excludedId = 0;
-  if (info.Length() > 2 && info[2].IsNumber()) {
-      excludedId = info[2].As<Napi::Number>().Int32Value();
-  }
-
-  // 2. 获取屏幕窗口列表 (按 Z-Order 从顶到底)
-  CGWindowListOption listOptions = kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements;
-  CFArrayRef windowList = CGWindowListCopyWindowInfo(listOptions, kCGNullWindowID);
-
-  if (!windowList) return Napi::Number::New(env, 0);
-
-  int foundHandle = 0;
-
-  // 3. 遍历列表
-  for (NSDictionary *infoDict in (NSArray *)windowList) {
-    // 获取窗口区域
-    CGRect bounds;
-    CGRectMakeWithDictionaryRepresentation((CFDictionaryRef)infoDict[(id)kCGWindowBounds], &bounds);
-
-    // 判断坐标是否命中
-    if (CGRectContainsPoint(bounds, point)) {
-
-      // --- 排除 ID 逻辑开始 (Step A) ---
-      NSNumber *windowNumber = infoDict[(id)kCGWindowNumber];
-      if (excludedId != 0 && [windowNumber intValue] == excludedId) {
-          // ID 匹配，跳过此窗口，继续检查下一层窗口
-          continue;
-      }
-      // --- 排除 ID 逻辑结束 ---
-
-      // --- 原始过滤逻辑开始 ---
-
-      // 1. 忽略完全透明的窗口
-      NSNumber *alpha = infoDict[(id)kCGWindowAlpha];
-      if (alpha && [alpha floatValue] <= 0.01) continue;
-
-      // 2. 忽略特殊层级 (如系统背景、菜单栏阴影等)
-      // 普通应用窗口通常在层级 0
-      NSNumber *layer = infoDict[(id)kCGWindowLayer];
-      if (layer && [layer intValue] < 0) continue;
-
-      // 3. 确保它属于一个真实的前台应用程序
-      NSNumber *ownerPid = infoDict[(id)kCGWindowOwnerPID];
-      NSRunningApplication *app = [NSRunningApplication runningApplicationWithProcessIdentifier: [ownerPid intValue]];
-
-      if (app && app.activationPolicy == NSApplicationActivationPolicyRegular) {
-         // 找到了！记录 ID 并停止循环
-         foundHandle = [windowNumber intValue]; // windowNumber 已在 Step A 获取
-         break;
-      }
-      // --- 原始过滤逻辑结束 ---
+    if (info.Length() < 2 || !info[0].IsNumber() || !info[1].IsNumber()) {
+        Napi::TypeError::New(env, "Expected x and y coordinates (Number)").ThrowAsJavaScriptException();
+        return Napi::Number::New(env, 0);
     }
-  }
 
-  CFRelease(windowList);
+    double x = info[0].As<Napi::Number>().DoubleValue();
+    double y = info[1].As<Napi::Number>().DoubleValue();
+    CGPoint point = CGPointMake((CGFloat)x, (CGFloat)y);
 
-  // 返回找到的 ID，如果没找到则返回 0
-  return Napi::Number::New(env, foundHandle);
+    int excludedId = 0;
+    if (info.Length() > 2 && info[2].IsNumber()) {
+        excludedId = info[2].As<Napi::Number>().Int32Value();
+    }
+
+    CGWindowListOption listOptions = kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements;
+    CFArrayRef windowList = CGWindowListCopyWindowInfo(listOptions, kCGNullWindowID);
+
+    if (!windowList) return Napi::Number::New(env, 0);
+
+    int foundHandle = 0;
+
+    for (NSDictionary *infoDict in (NSArray *)windowList) {
+        CGRect bounds;
+        if (!CGRectMakeWithDictionaryRepresentation((CFDictionaryRef)infoDict[(id)kCGWindowBounds], &bounds)) {
+            continue;
+        }
+
+        if (CGRectContainsPoint(bounds, point)) {
+            NSNumber *windowNumber = infoDict[(id)kCGWindowNumber];
+            if (excludedId != 0 && [windowNumber intValue] == excludedId) {
+                continue;
+            }
+
+            NSNumber *alpha = infoDict[(id)kCGWindowAlpha];
+            if (alpha && [alpha floatValue] <= 0.01) continue;
+
+            NSNumber *layer = infoDict[(id)kCGWindowLayer];
+            if (layer && [layer intValue] < 0) continue;
+
+            NSNumber *ownerPid = infoDict[(id)kCGWindowOwnerPID];
+
+            @autoreleasepool {
+                NSRunningApplication *app = [NSRunningApplication runningApplicationWithProcessIdentifier: [ownerPid intValue]];
+
+                if (app && app.activationPolicy == NSApplicationActivationPolicyRegular) {
+                    foundHandle = [windowNumber intValue];
+                    break;
+                }
+            }
+        }
+    }
+
+    CFRelease(windowList);
+    return Napi::Number::New(env, foundHandle);
+}
+
+Napi::Value captureWindow(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+
+    if (info.Length() < 1 || !info[0].IsNumber()) {
+        Napi::TypeError::New(env, "Expected window handle ID (Number)").ThrowAsJavaScriptException();
+        return env.Null();
+    }
+
+    CGWindowID windowID = (CGWindowID)info[0].As<Napi::Number>().Int32Value();
+
+    if (windowID == 0 || windowID == kCGNullWindowID) {
+        return Napi::String::New(env, "");
+    }
+
+    @autoreleasepool {
+        CGImageRef windowImage = CGWindowListCreateImage(
+            CGRectNull,
+            kCGWindowListOptionIncludingWindow,
+            windowID,
+            kCGWindowImageBoundsIgnoreFraming
+        );
+
+        if (!windowImage) {
+            return Napi::String::New(env, "");
+        }
+
+        CFMutableDataRef pngData = CFDataCreateMutable(kCFAllocatorDefault, 0);
+        if (!pngData) {
+            CFRelease(windowImage);
+            return Napi::String::New(env, "");
+        }
+
+        CFStringRef typeIdentifier = CFSTR("public.png");
+        CGImageDestinationRef destination = CGImageDestinationCreateWithData(pngData, typeIdentifier, 1, NULL);
+
+        if (!destination) {
+            CFRelease(windowImage);
+            CFRelease(pngData);
+            return Napi::String::New(env, "");
+        }
+
+        CGImageDestinationAddImage(destination, windowImage, NULL);
+        bool success = CGImageDestinationFinalize(destination);
+
+        CFRelease(destination);
+        CFRelease(windowImage);
+
+        if (!success) {
+            CFRelease(pngData);
+            return Napi::String::New(env, "");
+        }
+
+        NSData *imageData = (NSData *)CFBridgingRelease(pngData);
+        if (!imageData || imageData.length == 0) {
+            return Napi::String::New(env, "");
+        }
+
+        NSString *base64String = [imageData base64EncodedStringWithOptions:0];
+        return Napi::String::New(env, [base64String UTF8String]);
+    }
+}
+
+// 导出的清理函数
+Napi::Value CleanupInvalidWindowsExport(const Napi::CallbackInfo& info) {
+    cleanupInvalidWindows();
+    return info.Env().Undefined();
+}
+
+// 模块卸载时的清理函数
+void CleanupOnModuleUnload(void*) {
+    cleanupWindowCache();
 }
 
 Napi::Object Init(Napi::Env env, Napi::Object exports) {
+    // 注册模块卸载时的清理函数
+    napi_add_env_cleanup_hook(env, CleanupOnModuleUnload, nullptr);
+
     exports.Set(Napi::String::New(env, "getWindows"),
                 Napi::Function::New(env, getWindows));
     exports.Set(Napi::String::New(env, "getActiveWindow"),
@@ -431,6 +743,11 @@ Napi::Object Init(Napi::Env env, Napi::Object exports) {
                 Napi::Function::New(env, requestAccessibility));
     exports.Set(Napi::String::New(env, "getWindowAtPoint"),
                 Napi::Function::New(env, getWindowAtPoint));
+    exports.Set(Napi::String::New(env, "captureWindow"),
+                Napi::Function::New(env, captureWindow));
+    exports.Set(Napi::String::New(env, "cleanup"),
+                Napi::Function::New(env, CleanupInvalidWindowsExport));
+
     return exports;
 }
 
