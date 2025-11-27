@@ -1,3 +1,5 @@
+#include <Availability.h>
+#include <sys/types.h> // 用于 pid_t
 #import <Foundation/Foundation.h>
 #import <AppKit/AppKit.h>
 #import <ApplicationServices/ApplicationServices.h>
@@ -58,10 +60,15 @@ void cleanupInvalidWindows() {
         int handle = pair.first;
         AXUIElementRef window = pair.second;
 
+        if (!window) {
+            windowsToRemove.push_back(handle);
+            continue;
+        }
+
         CFTypeRef role = NULL;
         AXError error = AXUIElementCopyAttributeValue(window, kAXRoleAttribute, &role);
 
-        if (error != kAXErrorSuccess) {
+        if (error != kAXErrorSuccess || !role) {
             windowsToRemove.push_back(handle);
         }
 
@@ -70,7 +77,9 @@ void cleanupInvalidWindows() {
 
     for (int handle : windowsToRemove) {
         if (windowsMap.count(handle)) {
-            CFRelease(windowsMap[handle]);
+            if (windowsMap[handle]) {
+                CFRelease(windowsMap[handle]);
+            }
             windowsMap.erase(handle);
         }
     }
@@ -107,13 +116,19 @@ AXError GetWindowIDFromAXElement(AXUIElementRef element, CGWindowID* outWindowID
     CFTypeRef positionValue = NULL;
     CFTypeRef sizeValue = NULL;
 
-    // [修复] 将变量声明移动到 goto 之前，防止跳过初始化
+    // 初始化变量
+    pid_t elementPid = 0;
     CGPoint windowPos = CGPointZero;
     CGSize windowSize = CGSizeZero;
-    pid_t elementPid;
 
-    // 1. 尝试 GWTIdentifier
-    AXError error = AXUIElementCopyAttributeValue(element, CFSTR("GWTIdentifier"), &gwtValue);
+    // 1. 先获取进程ID
+    AXError error = AXUIElementGetPid(element, &elementPid);
+    if (error != kAXErrorSuccess) {
+        return error; // 直接返回错误，不执行后续代码
+    }
+
+    // 2. 尝试 GWTIdentifier
+    error = AXUIElementCopyAttributeValue(element, CFSTR("GWTIdentifier"), &gwtValue);
     if (error == kAXErrorSuccess && gwtValue) {
         if (CFGetTypeID(gwtValue) == CFNumberGetTypeID()) {
             SInt64 tempID = 0;
@@ -125,12 +140,9 @@ AXError GetWindowIDFromAXElement(AXUIElementRef element, CGWindowID* outWindowID
         if (*outWindowID != 0) return kAXErrorSuccess;
     }
 
-    // 2. 几何匹配
-    error = AXUIElementGetPid(element, &elementPid);
-    if (error != kAXErrorSuccess) goto cleanup;
-
+    // 3. 几何匹配
     windowList = CGWindowListCopyWindowInfo(kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements, kCGNullWindowID);
-    if (!windowList) goto cleanup;
+    if (!windowList) return kAXErrorCannotComplete;
 
     error = AXUIElementCopyAttributeValue(element, kAXPositionAttribute, &positionValue);
     if (error != kAXErrorSuccess) goto cleanup;
@@ -138,7 +150,6 @@ AXError GetWindowIDFromAXElement(AXUIElementRef element, CGWindowID* outWindowID
     error = AXUIElementCopyAttributeValue(element, kAXSizeAttribute, &sizeValue);
     if (error != kAXErrorSuccess) goto cleanup;
 
-    // [修复] 添加 (AXValueType) 显式强制转换
     if (AXValueGetValue((AXValueRef)positionValue, (AXValueType)kAXValueCGPointType, &windowPos) &&
         AXValueGetValue((AXValueRef)sizeValue, (AXValueType)kAXValueCGSizeType, &windowSize)) {
 
