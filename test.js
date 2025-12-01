@@ -1,4 +1,5 @@
 import { windowManager } from "./dist/index.js"
+import fs from "fs"
 
 async function main() {
   // active window
@@ -38,8 +39,17 @@ async function main() {
 
   console.log(`---`)
 
-  // const image = windowManager.captureWindow(pointWindow.id)
-  // console.log(`image: `, image)
+  const image = windowManager.captureWindow(pointWindow.id)
+  console.log(`image: `, image.length)
+
+  // 移除 base64 前缀（如果有）
+  const base64Data = image.replace(/^data:image\/png;base64,/, '');
+
+  // 将 base64 字符串转换为 Buffer
+  const buffer = Buffer.from(base64Data, 'base64');
+
+  // 写入文件
+  fs.writeFileSync('./test.png', buffer);
 
   windowManager.cleanup()
 }
