@@ -20,7 +20,7 @@ export class Window {
 
   setFullScreen() {
     if (!addon) return
-    addon.setWindowFullScreenCover()
+    addon.setWindowFullScreenCover(this.id)
   }
 
   getBounds(): IRectangle {
