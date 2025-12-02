@@ -667,51 +667,90 @@ Napi::Value captureWindow(const Napi::CallbackInfo& info) {
         return Napi::String::New(env, "");
     }
 
+        // 或者使用最高质量选项
+    CGWindowImageOption options = kCGWindowImageBoundsIgnoreFraming | kCGWindowImageBestResolution;
+
     @autoreleasepool {
         CGImageRef windowImage = CGWindowListCreateImage(
             CGRectNull,
             kCGWindowListOptionIncludingWindow,
             windowID,
-            kCGWindowImageBoundsIgnoreFraming
+            options
         );
 
         if (!windowImage) {
             return Napi::String::New(env, "");
         }
 
-        CFMutableDataRef pngData = CFDataCreateMutable(kCFAllocatorDefault, 0);
-        if (!pngData) {
-            CFRelease(windowImage);
+        // --- 优化核心：使用 NSImage 处理 Retina 缩放 ---
+
+        // 2. 将 CGImageRef 转换为 NSImage
+        NSImage *image = [[NSImage alloc] initWithCGImage:windowImage size:NSZeroSize];
+        CFRelease(windowImage); // 立即释放 CGImageRef
+
+        if (!image) {
+             return Napi::String::New(env, "");
+        }
+
+        // 3. 获取 NSImage 的最高分辨率表示 (NSBitmapImageRep)
+        // 这一步确保了 Retina 图像可以被正确地以 2x 甚至 3x 像素密度编码。
+        NSBitmapImageRep *rep = [NSBitmapImageRep imageRepWithData:[image TIFFRepresentation]];
+
+        if (!rep) {
+            // NSImage 会在 autoreleasepool 结束时释放
             return Napi::String::New(env, "");
         }
 
-        CFStringRef typeIdentifier = CFSTR("public.png");
-        CGImageDestinationRef destination = CGImageDestinationCreateWithData(pngData, typeIdentifier, 1, NULL);
+        // 4. 将 NSBitmapImageRep 编码为 PNG 格式的 NSData
+        NSData *imageData = [rep representationUsingType:NSBitmapImageFileTypePNG properties:@{}];
 
-        if (!destination) {
-            CFRelease(windowImage);
-            CFRelease(pngData);
-            return Napi::String::New(env, "");
-        }
-
-        CGImageDestinationAddImage(destination, windowImage, NULL);
-        bool success = CGImageDestinationFinalize(destination);
-
-        CFRelease(destination);
-        CFRelease(windowImage);
-
-        if (!success) {
-            CFRelease(pngData);
-            return Napi::String::New(env, "");
-        }
-
-        NSData *imageData = (NSData *)CFBridgingRelease(pngData);
+        // 5. 检查并 Base64 编码
         if (!imageData || imageData.length == 0) {
             return Napi::String::New(env, "");
         }
 
         NSString *base64String = [imageData base64EncodedStringWithOptions:0];
         return Napi::String::New(env, [base64String UTF8String]);
+//
+//
+//         CFMutableDataRef pngData = CFDataCreateMutable(kCFAllocatorDefault, 0);
+//         if (!pngData) {
+//             CFRelease(windowImage);
+//             return Napi::String::New(env, "");
+//         }
+//
+//         CFStringRef typeIdentifier = CFSTR("public.png");
+//         CGImageDestinationRef destination = CGImageDestinationCreateWithData(pngData, typeIdentifier, 1, NULL);
+//
+//         if (!destination) {
+//             CFRelease(windowImage);
+//             CFRelease(pngData);
+//             return Napi::String::New(env, "");
+//         }
+//
+//         // 高质量PNG设置
+//         NSDictionary *properties = @{
+//             (__bridge NSString *)kCGImageDestinationLossyCompressionQuality: @1.0
+//         };
+//
+//         CGImageDestinationAddImage(destination, windowImage, (__bridge CFDictionaryRef)properties);
+//         bool success = CGImageDestinationFinalize(destination);
+//
+//         CFRelease(destination);
+//         CFRelease(windowImage);
+//
+//         if (!success) {
+//             CFRelease(pngData);
+//             return Napi::String::New(env, "");
+//         }
+//
+//         NSData *imageData = (NSData *)CFBridgingRelease(pngData);
+//         if (!imageData || imageData.length == 0) {
+//             return Napi::String::New(env, "");
+//         }
+//
+//         NSString *base64String = [imageData base64EncodedStringWithOptions:0];
+//         return Napi::String::New(env, [base64String UTF8String]);
     }
 }
 
