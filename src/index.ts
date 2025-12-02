@@ -75,6 +75,11 @@ class WindowManager extends EventEmitter {
     return addon.captureWindow(windowID)
   }
 
+  getDesktopWindowID() {
+    if (!addon) return
+    return addon.getDesktopWindow()
+  }
+
   cleanup() {
     if (!addon) return
     return addon.cleanup()

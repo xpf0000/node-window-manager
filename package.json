@@ -1,6 +1,6 @@
 {
   "name": "@xpf0000/node-window-manager",
-  "version": "0.0.7",
+  "version": "0.0.8",
   "description": "Manage windows in macOS, Windows and Linux",
   "publishConfig": {
     "access": "public"

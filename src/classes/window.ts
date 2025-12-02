@@ -18,6 +18,11 @@ export class Window {
     this.path = path
   }
 
+  setFullScreen() {
+    if (!addon) return
+    addon.setWindowFullScreenCover()
+  }
+
   getBounds(): IRectangle {
     if (!addon) return
 

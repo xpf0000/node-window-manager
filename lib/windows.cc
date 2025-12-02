@@ -561,10 +561,7 @@ Napi::Number getWindowAtPoint(const Napi::CallbackInfo& info) {
 
     long x = info[0].As<Napi::Number>().Int32Value();
     long y = info[1].As<Napi::Number>().Int32Value();
-
-    POINT pt;
-    pt.x = x;
-    pt.y = y;
+    POINT pt = { x, y };
 
     HWND excludedWindow = NULL;
     if (info.Length() > 2 && info[2].IsNumber()) {
@@ -572,34 +569,95 @@ Napi::Number getWindowAtPoint(const Napi::CallbackInfo& info) {
         excludedWindow = reinterpret_cast<HWND>(excludedHandle);
     }
 
-    HWND finalWindow = NULL;
-    HWND currentWindow = WindowFromPoint(pt);
+    HWND targetWindow = NULL;
 
-    while (currentWindow != NULL) {
-        HWND hRoot = GetAncestor(currentWindow, GA_ROOT);
-        if (hRoot != NULL) {
-            currentWindow = hRoot;
+    // 1. 首先尝试最快速的系统 API
+    HWND hitWindow = WindowFromPoint(pt);
+
+    // 获取实际的顶层窗口 (因为 WindowFromPoint 可能会返回按钮等子控件)
+    if (hitWindow != NULL) {
+        HWND root = GetAncestor(hitWindow, GA_ROOT);
+        if (root != NULL) {
+            hitWindow = root;
         }
-
-        if (excludedWindow != NULL && currentWindow == excludedWindow) {
-            EnableWindow(currentWindow, FALSE);
-            HWND nextWindow = WindowFromPoint(pt);
-            EnableWindow(currentWindow, TRUE);
-
-            if (nextWindow == currentWindow || nextWindow == NULL) {
-                currentWindow = NULL;
-                break;
-            }
-
-            currentWindow = nextWindow;
-            continue;
-        }
-
-        finalWindow = currentWindow;
-        break;
     }
 
-    return Napi::Number::New(env, reinterpret_cast<int64_t>(finalWindow));
+    // 2. 如果命中的不是被忽略的窗口，直接返回结果
+    if (excludedWindow == NULL || hitWindow != excludedWindow) {
+        targetWindow = hitWindow;
+    }
+    else {
+        // 3. 如果命中了被忽略的窗口，我们需要“手动”寻找它下方的窗口
+        // 从 excludedWindow 的下一个 Z 序窗口开始遍历
+        HWND current = GetWindow(excludedWindow, GW_HWNDNEXT);
+
+        while (current != NULL) {
+            // 必须是可见的窗口
+            if (IsWindowVisible(current)) {
+                RECT rc;
+                GetWindowRect(current, &rc);
+
+                // 检查点是否在矩形内
+                if (PtInRect(&rc, pt)) {
+                   targetWindow = current;
+                   break; // 找到了！
+                }
+            }
+            // 继续找下一个
+            current = GetWindow(current, GW_HWNDNEXT);
+        }
+    }
+
+    // 最后的安全检查：确保返回的是顶层窗口句柄
+    if (targetWindow != NULL) {
+        HWND root = GetAncestor(targetWindow, GA_ROOT);
+        if (root != NULL) targetWindow = root;
+    }
+
+    return Napi::Number::New(env, reinterpret_cast<int64_t>(targetWindow));
+}
+
+// 获取桌面窗口句柄ID
+Napi::Value getDesktopWindow(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    try {
+        // 获取桌面窗口句柄
+        HWND desktopHwnd = GetDesktopWindow();
+
+        if (!desktopHwnd || !IsWindow(desktopHwnd)) {
+            Napi::Error::New(env, "无法获取桌面窗口句柄").ThrowAsJavaScriptException();
+            return env.Null();
+        }
+
+        // 验证窗口信息
+        RECT rect;
+        if (!GetWindowRect(desktopHwnd, &rect)) {
+            Napi::Error::New(env, "无法获取桌面窗口区域").ThrowAsJavaScriptException();
+            return env.Null();
+        }
+
+        int width = rect.right - rect.left;
+        int height = rect.bottom - rect.top;
+
+        std::cout << "[DEBUG] 桌面窗口句柄: " << desktopHwnd
+                  << ", 尺寸: " << width << "x" << height << std::endl;
+
+        // 返回句柄的整数值（确保在64位系统上正确处理）
+        #ifdef _WIN64
+            int64_t handleValue = reinterpret_cast<int64_t>(desktopHwnd);
+        #else
+            int32_t handleValue = reinterpret_cast<int32_t>(desktopHwnd);
+        #endif
+
+        return Napi::Number::New(env, handleValue);
+
+    } catch (const std::exception& e) {
+        Napi::Error::New(env, std::string("获取桌面句柄失败: ") + e.what()).ThrowAsJavaScriptException();
+        return env.Null();
+    } catch (...) {
+        Napi::Error::New(env, "未知错误").ThrowAsJavaScriptException();
+        return env.Null();
+    }
 }
 
 // 导出的清理函数
@@ -607,11 +665,72 @@ Napi::Value CleanupInvalidWindowsExport(const Napi::CallbackInfo& info) {
     return info.Env().Undefined();
 }
 
+/**
+ * 设置指定句柄的窗口全屏覆盖，并将其置于最顶层（覆盖任务栏）。
+ * @param info Napi::CallbackInfo，包含窗口句柄ID (Number)。
+ * @return Napi::Boolean，表示操作是否成功。
+ */
+Napi::Boolean setWindowFullScreenCover(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+
+    // 1. 检查输入参数
+    if (info.Length() < 1 || !info[0].IsNumber()) {
+        Napi::TypeError::New(env, "Expected a window handle (Number)").ThrowAsJavaScriptException();
+        return Napi::Boolean::New(env, false);
+    }
+
+    // 2. 转换窗口句柄
+    int64_t handleValue = info[0].As<Napi::Number>().Int64Value();
+    HWND targetWindow = reinterpret_cast<HWND>(handleValue);
+
+    if (targetWindow == NULL || !IsWindow(targetWindow)) {
+        std::cout << "[DEBUG] setWindowFullScreenCover - 无效的窗口句柄!" << std::endl;
+        return Napi::Boolean::New(env, false);
+    }
+
+    // 3. 获取屏幕尺寸
+    int screenWidth = GetSystemMetrics(SM_CXSCREEN);
+    int screenHeight = GetSystemMetrics(SM_CYSCREEN);
+
+    // 4. 关键步骤：修改窗口扩展样式
+    LONG_PTR extendedStyle = GetWindowLongPtr(targetWindow, GWL_EXSTYLE);
+
+    // 添加必要的扩展样式
+    extendedStyle |= WS_EX_TOOLWINDOW;    // 设置为工具窗口，避免任务栏显示
+    extendedStyle |= WS_EX_LAYERED;        // 支持分层窗口（透明度）
+    extendedStyle |= WS_EX_TOPMOST;        // 顶层窗口
+
+    SetWindowLongPtr(targetWindow, GWL_EXSTYLE, extendedStyle);
+
+    // 5. 修改窗口样式（移除标题栏、边框等）
+    LONG_PTR style = GetWindowLongPtr(targetWindow, GWL_STYLE);
+    style &= ~WS_CAPTION;     // 移除标题栏
+    style &= ~WS_THICKFRAME;  // 移除可调整大小的边框
+    style &= ~WS_SYSMENU;     // 移除系统菜单
+    style |= WS_POPUP;        // 设置为弹出窗口
+
+    SetWindowLongPtr(targetWindow, GWL_STYLE, style);
+
+    // 6. 设置分层窗口属性（支持透明度）
+    SetLayeredWindowAttributes(targetWindow, 0, 255, LWA_ALPHA);
+
+    // 7. 设置窗口位置、大小和 Z-Order
+    BOOL success = SetWindowPos(
+        targetWindow,
+        HWND_TOPMOST,
+        0, 0, screenWidth, screenHeight,
+        SWP_SHOWWINDOW | SWP_FRAMECHANGED
+    );
+
+    // 8. 强制重绘窗口
+    RedrawWindow(targetWindow, NULL, NULL,
+                RDW_ERASE | RDW_FRAME | RDW_INVALIDATE | RDW_ALLCHILDREN);
+
+    return Napi::Boolean::New(env, success != 0);
+}
+
 // 模块初始化函数
 Napi::Object Init(Napi::Env env, Napi::Object exports) {
-    // 确保WinRT在模块初始化时只初始化一次
-    EnsureWinRTInitialized();
-
     // 窗口管理函数导出
     exports.Set(Napi::String::New(env, "getActiveWindow"), Napi::Function::New(env, getActiveWindow));
     exports.Set(Napi::String::New(env, "getMonitorFromWindow"), Napi::Function::New(env, getMonitorFromWindow));
@@ -647,6 +766,10 @@ Napi::Object Init(Napi::Env env, Napi::Object exports) {
     exports.Set(Napi::String::New(env, "captureWindow"), Napi::Function::New(env, captureWindow));
 
     exports.Set(Napi::String::New(env, "cleanup"), Napi::Function::New(env, CleanupInvalidWindowsExport));
+
+    exports.Set(Napi::String::New(env, "setWindowFullScreenCover"), Napi::Function::New(env, setWindowFullScreenCover));
+
+    exports.Set(Napi::String::New(env, "getDesktopWindow"), Napi::Function::New(env, getDesktopWindow));
 
     return exports;
 }

@@ -64,68 +64,6 @@ std::string base64_encode(unsigned char const* bytes_to_encode, unsigned int in_
     return ret;
 }
 
-bool ScreenCaptureManager::CaptureWindow(HWND hwnd, std::vector<uint8_t>& rgbaData, int& width, int& height) {
-    std::lock_guard<std::mutex> lock(m_mutex);
-    try {
-        if (!Initialize()) {
-            return false;
-        }
-        if (!CreateCaptureItem(hwnd)) {
-            return false;
-        }
-        auto frame = CaptureSingleFrame();
-
-        if (!frame) {
-            return false;
-        }
-
-        // 检查帧是否有效
-        try {
-            auto surface = frame.Surface();
-
-            if (!surface) {
-                return false;
-            }
-
-            // 尝试获取surface的尺寸信息
-            try {
-                auto size = frame.ContentSize();
-            } catch (...) {
-            }
-            winrt::com_ptr<ID3D11Texture2D> texture;
-            texture = GetDXGIInterfaceFromObject<ID3D11Texture2D>(surface);
-            // 调试信息（保留）
-            if (!texture) {
-                Cleanup();
-                return false;
-            }
-
-            // 获取纹理信息
-            D3D11_TEXTURE2D_DESC desc;
-            texture->GetDesc(&desc);
-            rgbaData = TextureToRGBData(m_d3dDevice.get(), texture.get());
-            if (rgbaData.empty()) {
-                Cleanup();
-                return false;
-            }
-
-            width = desc.Width;
-            height = desc.Height;
-            Cleanup();
-            return true;
-
-        } catch (...) {
-            Cleanup();
-            return false;
-        }
-
-    }
-    catch (...) {
-        Cleanup();
-        return false;
-    }
-}
-
 bool ScreenCaptureManager::Initialize() {
     try {
         // 使用本地 D3D11Helpers 创建设备
@@ -167,6 +105,125 @@ bool ScreenCaptureManager::Initialize() {
         return true;
     }
     catch (...) {
+        return false;
+    }
+}
+
+// 专门处理桌面捕获
+bool ScreenCaptureManager::CaptureDesktop(std::vector<uint8_t>& rgbaData, int& width, int& height) {
+    try {
+        auto monitor = MonitorFromWindow(GetDesktopWindow(), MONITOR_DEFAULTTOPRIMARY);
+        m_captureItem = CaptureInterop::CreateCaptureItemForMonitor(monitor);
+        if (!m_captureItem) {
+            std::cout << "[ERROR] Failed to create capture item for monitor" << std::endl;
+            return false;
+        }
+
+        auto frame = CaptureSingleFrame();
+        if (!frame) {
+            std::cout << "[ERROR] Failed to capture desktop frame" << std::endl;
+            return false;
+        }
+        auto surface = frame.Surface();
+        if (!surface) {
+            std::cout << "[ERROR] Invalid surface from desktop frame" << std::endl;
+            return false;
+        }
+        winrt::com_ptr<ID3D11Texture2D> texture = GetDXGIInterfaceFromObject<ID3D11Texture2D>(surface);
+        if (!texture) {
+            std::cout << "[ERROR] Failed to get texture from desktop surface" << std::endl;
+            Cleanup();
+            return false;
+        }
+        D3D11_TEXTURE2D_DESC desc;
+        texture->GetDesc(&desc);
+
+        rgbaData = TextureToRGBData(m_d3dDevice.get(), texture.get());
+        if (rgbaData.empty()) {
+            std::cout << "[ERROR] Failed to convert desktop texture to RGB" << std::endl;
+            Cleanup();
+            return false;
+        }
+        width = desc.Width;
+        height = desc.Height;
+
+        Cleanup();
+        return true;
+    }
+    catch (const std::exception& e) {
+        std::cout << "[ERROR] Desktop capture exception: " << e.what() << std::endl;
+        Cleanup();
+        return false;
+    }
+    catch (...) {
+        std::cout << "[ERROR] Unknown exception in desktop capture" << std::endl;
+        Cleanup();
+        return false;
+    }
+}
+
+// 普通窗口捕获（原有逻辑）
+bool ScreenCaptureManager::CaptureNormalWindow(HWND hwnd, std::vector<uint8_t>& rgbaData, int& width, int& height) {
+   try {
+        if (!CreateCaptureItem(hwnd)) {
+            std::cout << "[ERROR] Failed to create capture item for window" << std::endl;
+            return false;
+        }
+
+        auto frame = CaptureSingleFrame();
+        if (!frame) {
+            std::cout << "[ERROR] Failed to capture window frame" << std::endl;
+            return false;
+        }
+
+        auto surface = frame.Surface();
+        if (!surface) {
+            std::cout << "[ERROR] Invalid surface from window frame" << std::endl;
+            Cleanup();
+            return false;
+        }
+
+        winrt::com_ptr<ID3D11Texture2D> texture = GetDXGIInterfaceFromObject<ID3D11Texture2D>(surface);
+        if (!texture) {
+            Cleanup();
+            return false;
+        }
+
+        D3D11_TEXTURE2D_DESC desc;
+        texture->GetDesc(&desc);
+
+        rgbaData = TextureToRGBData(m_d3dDevice.get(), texture.get());
+        if (rgbaData.empty()) {
+            Cleanup();
+            return false;
+        }
+
+        width = desc.Width;
+        height = desc.Height;
+
+        Cleanup();
+        return true;
+    } catch (...) {
+        Cleanup();
+        return false;
+    }
+}
+
+bool ScreenCaptureManager::CaptureWindow(HWND hwnd, std::vector<uint8_t>& rgbaData, int& width, int& height) {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    try {
+        if (!Initialize()) {
+            return false;
+        }
+        // 检查是否为桌面窗口
+        if (hwnd == GetDesktopWindow()) {
+            return CaptureDesktop(rgbaData, width, height);
+        } else {
+            return CaptureNormalWindow(hwnd, rgbaData, width, height);
+        }
+    }
+    catch (...) {
+        Cleanup();
         return false;
     }
 }
@@ -535,6 +592,7 @@ Napi::Value captureWindow(const Napi::CallbackInfo& info) {
         bool success = ScreenCaptureManager::GetInstance().CaptureWindow(hwnd, rgbaData, width, height);
 
         if (!success) {
+            std::cout << "[ERROR] CaptureWindow not success" << std::endl;
             return env.Null();
         }
 
@@ -546,6 +604,7 @@ Napi::Value captureWindow(const Napi::CallbackInfo& info) {
         std::vector<uint8_t> pngData = ConvertRgbToPng(rgbaData, width, height);
 
         if (pngData.empty()) {
+            std::cout << "[ERROR] ConvertRgbToPng not success" << std::endl;
             return env.Null();
         }
 
@@ -553,6 +612,7 @@ Napi::Value captureWindow(const Napi::CallbackInfo& info) {
         std::string base64Data = base64_encode(pngData.data(), pngData.size());
 
         if (base64Data.empty()) {
+            std::cout << "[ERROR] base64_encode not success" << std::endl;
             return env.Null();
         }
 
