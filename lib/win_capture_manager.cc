@@ -20,7 +20,7 @@ std::atomic<bool> g_winrtInitialized{ false };
 
 void EnsureWinRTInitialized() {
     if (!g_winrtInitialized.exchange(true)) {
-        winrt::init_apartment(winrt::apartment_type::multi_threaded);
+        winrt::init_apartment(winrt::apartment_type::single_threaded);
     }
 }
 
