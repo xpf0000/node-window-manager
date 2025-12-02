@@ -711,46 +711,6 @@ Napi::Value captureWindow(const Napi::CallbackInfo& info) {
 
         NSString *base64String = [imageData base64EncodedStringWithOptions:0];
         return Napi::String::New(env, [base64String UTF8String]);
-//
-//
-//         CFMutableDataRef pngData = CFDataCreateMutable(kCFAllocatorDefault, 0);
-//         if (!pngData) {
-//             CFRelease(windowImage);
-//             return Napi::String::New(env, "");
-//         }
-//
-//         CFStringRef typeIdentifier = CFSTR("public.png");
-//         CGImageDestinationRef destination = CGImageDestinationCreateWithData(pngData, typeIdentifier, 1, NULL);
-//
-//         if (!destination) {
-//             CFRelease(windowImage);
-//             CFRelease(pngData);
-//             return Napi::String::New(env, "");
-//         }
-//
-//         // 高质量PNG设置
-//         NSDictionary *properties = @{
-//             (__bridge NSString *)kCGImageDestinationLossyCompressionQuality: @1.0
-//         };
-//
-//         CGImageDestinationAddImage(destination, windowImage, (__bridge CFDictionaryRef)properties);
-//         bool success = CGImageDestinationFinalize(destination);
-//
-//         CFRelease(destination);
-//         CFRelease(windowImage);
-//
-//         if (!success) {
-//             CFRelease(pngData);
-//             return Napi::String::New(env, "");
-//         }
-//
-//         NSData *imageData = (NSData *)CFBridgingRelease(pngData);
-//         if (!imageData || imageData.length == 0) {
-//             return Napi::String::New(env, "");
-//         }
-//
-//         NSString *base64String = [imageData base64EncodedStringWithOptions:0];
-//         return Napi::String::New(env, [base64String UTF8String]);
     }
 }
 
