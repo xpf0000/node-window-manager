@@ -59,6 +59,9 @@ private:
     bool CreateCaptureItem(HWND hwnd);
     bool CaptureNormalWindow(HWND hwnd, std::vector<uint8_t>& rgbaData, int& width, int& height);
     bool CaptureDesktop(std::vector<uint8_t>& rgbaData, int& width, int& height);
+    // 新增：GDI 截图方法
+    bool CaptureDesktopWithGDI(std::vector<uint8_t>& rgbaData, int& width, int& height);
+
     winrt::Direct3D11CaptureFrame CaptureSingleFrame();
     std::vector<uint8_t> TextureToRGBData(ID3D11Device* device, ID3D11Texture2D* texture);
     void Cleanup();

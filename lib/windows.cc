@@ -4,6 +4,9 @@
 #include <vector>
 #include <iostream>
 #include "win_capture_manager.h"
+// 引入 DWM API 所需的头文件
+#include <dwmapi.h>
+#pragma comment(lib, "dwmapi.lib") // 编译时确保链接 dwmapi.lib
 
 // 辅助函数和类型定义
 struct Process {
@@ -186,11 +189,27 @@ Napi::Object initWindow(const Napi::CallbackInfo& info) {
 Napi::Object getWindowBounds(const Napi::CallbackInfo& info) {
     Napi::Env env{ info.Env() };
 
+    // 获取窗口句柄
     auto handle{ getValueFromCallbackData<HWND>(info, 0) };
 
     RECT rect{};
-    GetWindowRect(handle, &rect);
+    // DWMWA_EXTENDED_FRAME_BOUNDS 的值是 9
+    const int DWMWA_EXTENDED_FRAME_BOUNDS = 9;
 
+    // 1. 尝试使用 DwmGetWindowAttribute 获取“扩展的框架边界”（不包含阴影）
+    HRESULT hr = DwmGetWindowAttribute(
+        handle,
+        (DWORD)DWMWA_EXTENDED_FRAME_BOUNDS,
+        &rect,
+        sizeof(RECT)
+    );
+
+    // 2. 如果 DwmGetWindowAttribute 失败或不可用 (例如非 Vista+ 系统)，则回退到 GetWindowRect
+    if (hr != S_OK) {
+        GetWindowRect(handle, &rect);
+    }
+
+    // 3. 构建 Napi::Object 返回边界
     Napi::Object bounds{ Napi::Object::New(env) };
 
     bounds.Set("x", rect.left);
@@ -476,23 +495,6 @@ Napi::Boolean setWindowAsPopup(const Napi::CallbackInfo& info) {
 
     return Napi::Boolean::New(env, true);
 }
-
-enum DWMWINDOWATTRIBUTE {
-    DWMWA_WINDOW_CORNER_PREFERENCE = 33
-};
-
-enum DWM_WINDOW_CORNER_PREFERENCE {
-    DWMWCP_DEFAULT = 0,
-    DWMWCP_DONOTROUND = 1,
-    DWMWCP_ROUND = 2,
-    DWMWCP_ROUNDSMALL = 3
-};
-
-extern "C" __declspec(dllimport)
-HRESULT DwmSetWindowAttribute(HWND hwnd,
-    DWMWINDOWATTRIBUTE dwAttribute,
-    LPCVOID pvAttribute,
-    DWORD cbAttribute);
 
 Napi::Boolean setWindowAsPopupWithRoundedCorners(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
