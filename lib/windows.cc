@@ -596,6 +596,28 @@ Napi::Number getWindowAtPoint(const Napi::CallbackInfo& info) {
         while (current != NULL) {
             // 必须是可见的窗口
             if (IsWindowVisible(current)) {
+                // 1. 获取扩展样式
+                LONG_PTR exStyle = GetWindowLongPtr(current, GWL_EXSTYLE);
+                // 过滤掉鼠标穿透的窗口 (WS_EX_TRANSPARENT)
+                // 注意：通常 Layered 窗口才会有 Transparent 效果，但检查这个标志位最直接
+                if ((exStyle & WS_EX_TRANSPARENT) != 0) {
+                    current = GetWindow(current, GW_HWNDNEXT);
+                    continue;
+                }
+                  // 2. 过滤掉工具窗口 (可选，视需求而定，ToolWindow 通常不出现在任务栏，但也可能接受点击)
+//                 if ((exStyle & WS_EX_TOOLWINDOW) != 0) {
+//                     current = GetWindow(current, GW_HWNDNEXT);
+//                     continue;
+//                 }
+                // 3. 过滤掉被系统 "Cloaked" 的窗口 (Win8+ 特性，很多 UWP 后台窗口虽然 Visible 但是不可见)
+                int cloakedVal = 0;
+                HRESULT hr = DwmGetWindowAttribute(current, DWMWA_CLOAKED, &cloakedVal, sizeof(cloakedVal));
+                if (SUCCEEDED(hr) && cloakedVal != 0) {
+                    // 窗口被系统隐藏了（例如在另一个虚拟桌面，或者是挂起的 UWP 进程）
+                    current = GetWindow(current, GW_HWNDNEXT);
+                    continue;
+                }
+
                 RECT rc;
                 GetWindowRect(current, &rc);
 
@@ -640,9 +662,6 @@ Napi::Value getDesktopWindow(const Napi::CallbackInfo& info) {
 
         int width = rect.right - rect.left;
         int height = rect.bottom - rect.top;
-
-        std::cout << "[DEBUG] 桌面窗口句柄: " << desktopHwnd
-                  << ", 尺寸: " << width << "x" << height << std::endl;
 
         // 返回句柄的整数值（确保在64位系统上正确处理）
         #ifdef _WIN64
