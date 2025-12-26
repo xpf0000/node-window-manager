@@ -37,33 +37,33 @@ async function main() {
     }
   }
 
-  // console.log(`---`)
-  //
-  // const image = windowManager.captureWindow(pointWindow.id)
-  // console.log(`image: `, image.length)
-  //
-  // // 移除 base64 前缀（如果有）
-  // const base64Data = image.replace(/^data:image\/png;base64,/, '');
-  //
-  // // 将 base64 字符串转换为 Buffer
-  // const buffer = Buffer.from(base64Data, 'base64');
-  //
-  // // 写入文件
-  // fs.writeFileSync('./test.png', buffer);
-  //
-  // const desktopID = windowManager.getDesktopWindowID()
-  // console.log(`desktopID: `, desktopID)
-  // const image1 = windowManager.captureWindow(desktopID)
-  // console.log(`image1: `, image1.length)
-  //
-  // // 移除 base64 前缀（如果有）
-  // const base64Data1 = image1.replace(/^data:image\/png;base64,/, '');
-  //
-  // // 将 base64 字符串转换为 Buffer
-  // const buffer1 = Buffer.from(base64Data1, 'base64');
-  //
-  // // 写入文件
-  // fs.writeFileSync('./test1.png', buffer1);
+  console.log(`---`)
+
+  const image = windowManager.captureWindow(pointWindow.id)
+  console.log(`image: `, image.length)
+
+  // 移除 base64 前缀（如果有）
+  const base64Data = image.replace(/^data:image\/png;base64,/, '');
+
+  // 将 base64 字符串转换为 Buffer
+  const buffer = Buffer.from(base64Data, 'base64');
+
+  // 写入文件
+  fs.writeFileSync('./test.png', buffer);
+
+  const desktopID = windowManager.getDesktopWindowID()
+  console.log(`desktopID: `, desktopID)
+  const image1 = windowManager.captureWindow(desktopID)
+  console.log(`image1: `, image1.length)
+
+  // 移除 base64 前缀（如果有）
+  const base64Data1 = image1.replace(/^data:image\/png;base64,/, '');
+
+  // 将 base64 字符串转换为 Buffer
+  const buffer1 = Buffer.from(base64Data1, 'base64');
+
+  // 写入文件
+  fs.writeFileSync('./test1.png', buffer1);
 
   windowManager.cleanup()
 }

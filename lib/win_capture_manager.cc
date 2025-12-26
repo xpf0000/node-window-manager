@@ -9,6 +9,7 @@
 #include <windows.graphics.directx.direct3d11.interop.h>
 #include <winrt/Windows.Foundation.h> // 用于 winrt::com_ptr
 #include <winrt/base.h> // 确保 com_ptr 及其操作符可见
+#include <winrt/Windows.Foundation.Metadata.h>
 
 // ... 其他头文件，如 iostream, win_capture_manager.h 等
 #include "win_capture_manager.h"
@@ -20,6 +21,8 @@
 #include <wincodec.h>
 #include <objbase.h> // For CoUninitialize
 #include <Shlwapi.h> // For IStream utility (not strictly needed but good practice)
+
+using namespace winrt::Windows::Foundation::Metadata;
 
 // 全局WinRT初始化标志
 std::atomic<bool> g_winrtInitialized{ false };
@@ -336,6 +339,22 @@ winrt::Direct3D11CaptureFrame ScreenCaptureManager::CaptureSingleFrame() {
             size);
 
         m_session = m_framePool.CreateCaptureSession(m_captureItem);
+
+        // 2. 【核心修改】 设置为 false 以忽略鼠标
+        // 注意：这需要 Windows 10 Version 2004 (Build 19041) 或更高版本
+        // 检查 GraphicsCaptureSession 类中是否存在 IsCursorCaptureEnabled 属性
+        if (ApiInformation::IsPropertyPresent(
+                winrt::name_of<winrt::Windows::Graphics::Capture::GraphicsCaptureSession>(),
+                L"IsCursorCaptureEnabled"))
+        {
+            m_session.IsCursorCaptureEnabled(false);
+        }
+        if (ApiInformation::IsPropertyPresent(
+                winrt::name_of<winrt::Windows::Graphics::Capture::GraphicsCaptureSession>(),
+                L"IsBorderRequired"))
+        {
+            m_session.IsBorderRequired(false); // 隐藏黄色边框
+        }
 
         // 2. 使用事件进行同步
         hEvent = CreateEvent(nullptr, TRUE, FALSE, nullptr);
