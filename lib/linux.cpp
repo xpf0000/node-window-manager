@@ -1,26 +1,5 @@
 #include <napi.h>
 
-typedef Window HMONITOR;
-typedef int DEVICE_SCALE_FACTOR;
-
-struct Process {
-    unsigned long pid;
-    std::string path;
-};
-
-// 辅助函数：读取 X11 属性 (通用)
-unsigned char* get_x11_property(Display* disp, Window w, Atom prop, Atom* type_return, int* format_return, unsigned long* nitems_return) {
-    throw "Not implemented on Linux";
-}
-
-Process getWindowProcess (Window handle) {
-    throw "Not implemented on Linux";
-}
-
-Window find_top_window (unsigned long pid) {
-    throw "Not implemented on Linux";
-}
-
 Napi::Number getProcessMainWindow (const Napi::CallbackInfo& info) {
     throw "Not implemented on Linux";
 }
@@ -33,12 +12,6 @@ Napi::Number createProcess (const Napi::CallbackInfo& info) {
 Napi::Number getActiveWindow (const Napi::CallbackInfo& info) {
     throw "Not implemented on Linux";
 }
-
-template <typename T>
-T getValueFromCallbackData (const Napi::CallbackInfo& info, unsigned handleIndex) {
-    return static_cast<T> (info[handleIndex].As<Napi::Number> ().Int64Value ());
-}
-
 
 Napi::Object getWindowBounds (const Napi::CallbackInfo& info) {
     throw "Not implemented on Linux";
